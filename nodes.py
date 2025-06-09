@@ -5,6 +5,7 @@ import gc
 from .utils import log, print_memory, apply_lora, clip_encode_image_tiled, fourier_filter
 import numpy as np
 import math
+import hashlib
 from tqdm import tqdm
 
 from .wanvideo.modules.clip import CLIPModel
@@ -475,7 +476,9 @@ class WanVideoLoraBlockEdit:
         return (selected,)
 
 #region Model loading
-class WanVideoModelLoader:
+class WanVideoModelLoader:  
+    _last_cache_key = None
+    _last_result = None
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -513,6 +516,32 @@ class WanVideoModelLoader:
     def loadmodel(self, model, base_precision, load_device,  quantization,
                   compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, fantasytalking_model=None):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
+
+        cache_key = (
+            model, base_precision, quantization, load_device, attention_mode,
+            repr(compile_args), repr(block_swap_args), repr(lora), repr(vram_management_args)
+        )
+
+        if self.__class__._last_cache_key == cache_key:
+            print("WANVIDEO: Returning cached model")
+            return self.__class__._last_result
+        else:
+            if self.__class__._last_result is not None:
+                # Explicitly move tensors to CPU and delete
+                result = self.__class__._last_result
+                if isinstance(result, tuple) and isinstance(result[0], dict):
+                    for k, v in result[0].items():
+                        if isinstance(v, list):
+                            for t in v:
+                                if isinstance(t, torch.Tensor):
+                                    t.cpu()
+                del result
+
+            self.__class__._last_cache_key = None
+            self.__class__._last_result = None
+            torch.cuda.empty_cache()
+            gc.collect()
+
         lora_low_mem_load = False
         if lora is not None:
             for l in lora:
@@ -880,7 +909,10 @@ class WanVideoModelLoader:
 
         for model in mm.current_loaded_models:
             if model._model() == patcher:
-                mm.current_loaded_models.remove(model)            
+                mm.current_loaded_models.remove(model)              
+
+        self.__class__._last_cache_key = cache_key
+        self.__class__._last_result = (patcher,)       
 
         return (patcher,)
 
@@ -1185,6 +1217,10 @@ class LoadWanVideoClipTextEncoder:
     
 
 class WanVideoTextEncode:
+
+    _last_cache_key = None
+    _last_result = None
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
@@ -1208,6 +1244,35 @@ class WanVideoTextEncode:
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
+
+        cache_key = (
+            positive_prompt,
+            negative_prompt,
+            id(t5["model"]),  # use id() to uniquely track this encoder instance
+            t5.get("dtype"),
+            force_offload,
+            id(model_to_offload.model) if model_to_offload is not None else None,
+        )
+
+        if self.__class__._last_cache_key == cache_key:
+            print("WANVIDEO TEXTENCODE: Returning cached embeddings")
+            return self.__class__._last_result
+        else:
+            if self.__class__._last_result is not None:
+                # Explicitly move tensors to CPU and delete
+                result = self.__class__._last_result
+                if isinstance(result, tuple) and isinstance(result[0], dict):
+                    for k, v in result[0].items():
+                        if isinstance(v, list):
+                            for t in v:
+                                if isinstance(t, torch.Tensor):
+                                    t.cpu()
+                del result
+
+            self.__class__._last_cache_key = None
+            self.__class__._last_result = None
+            torch.cuda.empty_cache()
+            gc.collect()
 
         if model_to_offload is not None:
             log.info(f"Moving video model to {offload_device}")
@@ -1248,6 +1313,10 @@ class WanVideoTextEncode:
                 "prompt_embeds": context,
                 "negative_prompt_embeds": context_null,
             }
+
+        self.__class__._last_cache_key = cache_key
+        self.__class__._last_result = (prompt_embeds_dict,)
+        
         return (prompt_embeds_dict,)
     
     def parse_prompt_weights(self, prompt):
@@ -1930,6 +1999,10 @@ class WanVideoSLG:
 
 #region VACE
 class WanVideoVACEEncode:
+
+    _last_cache_key = None
+    _last_result = None
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
@@ -1957,6 +2030,39 @@ class WanVideoVACEEncode:
 
     def process(self, vae, width, height, num_frames, strength, vace_start_percent, vace_end_percent, input_frames=None, ref_images=None, input_masks=None, prev_vace_embeds=None, tiled_vae=False):
         
+        def _tensor_hash(tensor):
+            return hashlib.sha256(tensor.cpu().numpy().tobytes()).hexdigest()
+
+        cache_key = (
+            id(vae),
+            width, height, num_frames, strength, vace_start_percent, vace_end_percent,
+            _tensor_hash(input_frames) if input_frames is not None else None,
+            _tensor_hash(ref_images) if ref_images is not None else None,
+            _tensor_hash(input_masks) if input_masks is not None else None,
+            repr(prev_vace_embeds),
+            tiled_vae,
+        )
+
+        if self.__class__._last_cache_key == cache_key:
+            print("WanVideoVACEEncode: Returning cached embeds")
+            return self.__class__._last_result
+        else:
+            if self.__class__._last_result is not None:
+                # Explicitly move tensors to CPU and delete
+                result = self.__class__._last_result
+                if isinstance(result, tuple) and isinstance(result[0], dict):
+                    for k, v in result[0].items():
+                        if isinstance(v, list):
+                            for t in v:
+                                if isinstance(t, torch.Tensor):
+                                    t.cpu()
+                del result
+
+            self.__class__._last_cache_key = None
+            self.__class__._last_result = None
+            torch.cuda.empty_cache()
+            gc.collect()
+
         self.device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         self.vae = vae.to(self.device)
@@ -2035,7 +2141,10 @@ class WanVideoVACEEncode:
             if "additional_vace_inputs" in prev_vace_embeds and prev_vace_embeds["additional_vace_inputs"]:
                 vace_input["additional_vace_inputs"] = prev_vace_embeds["additional_vace_inputs"].copy()
             vace_input["additional_vace_inputs"].append(prev_vace_embeds)
-    
+                
+        self.__class__._last_cache_key = cache_key
+        self.__class__._last_result = (vace_input,)   
+
         return (vace_input,)
     def vace_encode_frames(self, frames, ref_images, masks=None, tiled_vae=False):
         if ref_images is None:
