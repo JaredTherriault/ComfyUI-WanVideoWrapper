@@ -362,70 +362,96 @@ class WanSelfAttention(nn.Module):
             x *= feta_scores
 
         return x
+    
+    def normalized_attention_guidance(self, b, n, d, q, context, nag_context=None, nag_params={}):
+        # NAG text attention
+        context_positive = context
+        context_negative = nag_context
+        nag_scale = nag_params['nag_scale']
+        nag_alpha = nag_params['nag_alpha']
+        nag_tau = nag_params['nag_tau']
 
+        k_positive = self.norm_k(self.k(context_positive)).view(b, -1, n, d)
+        v_positive = self.v(context_positive).view(b, -1, n, d)
+        k_negative = self.norm_k(self.k(context_negative)).view(b, -1, n, d)
+        v_negative = self.v(context_negative).view(b, -1, n, d)
 
+        x_positive = attention(q, k_positive, v_positive, k_lens=None, attention_mode=self.attention_mode)
+        x_positive = x_positive.flatten(2)
+
+        x_negative = attention(q, k_negative, v_negative, k_lens=None, attention_mode=self.attention_mode)
+        x_negative = x_negative.flatten(2)
+
+        nag_guidance = x_positive * nag_scale - x_negative * (nag_scale - 1)
+        
+        norm_positive = torch.norm(x_positive, p=1, dim=-1, keepdim=True).expand_as(x_positive)
+        norm_guidance = torch.norm(nag_guidance, p=1, dim=-1, keepdim=True).expand_as(nag_guidance)
+        
+        scale = norm_guidance / norm_positive
+        scale = torch.nan_to_num(scale, nan=10.0)
+        
+        mask = scale > nag_tau
+        adjustment = (norm_positive * nag_tau) / (norm_guidance + 1e-7)
+        nag_guidance = torch.where(mask, nag_guidance * adjustment, nag_guidance)
+        del mask, adjustment
+        
+        return nag_guidance * nag_alpha + x_positive * (1 - nag_alpha)
+
+#region T2V crossattn
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens, clip_embed=None, audio_proj=None, audio_context_lens=None, audio_scale=1.0, num_latent_frames=21):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L1, C]
-            context(Tensor): Shape [B, L2, C]
-            context_lens(Tensor): Shape [B]
-        """
+    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, attention_mode='sdpa'):
+        super().__init__(dim, num_heads, window_size, qk_norm, eps)
+        self.attention_mode = attention_mode
+
+    def forward(self, x, context, context_lens, clip_embed=None, audio_proj=None, audio_context_lens=None, audio_scale=1.0, 
+                num_latent_frames=21, nag_params={}, nag_context=None, is_uncond=False):
         b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        # compute query, key, value
+        # compute query
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
 
-        # compute attention
-        x = attention(q, k, v, k_lens=context_lens, attention_mode=self.attention_mode)
+        if nag_context is not None and not is_uncond:
+            x_text = self.normalized_attention_guidance(b, n, d, q, context, nag_context, nag_params)
+        else:
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
+            x_text = attention(q, k, v, k_lens=None, attention_mode=self.attention_mode)
+            x_text = x_text.flatten(2)
 
-        # output
-        x = x.flatten(2)
+        x = x_text
 
         # FantasyTalking audio attention
         if audio_proj is not None:
             if len(audio_proj.shape) == 4:
-                audio_q = q.view(b * num_latent_frames, -1, n, d)  # [b, 21, l1, n, d]
+                audio_q = q.view(b * num_latent_frames, -1, n, d)
                 ip_key = self.k_proj(audio_proj).view(b * num_latent_frames, -1, n, d)
                 ip_value = self.v_proj(audio_proj).view(b * num_latent_frames, -1, n, d)
                 audio_x = attention(
                     audio_q, ip_key, ip_value, k_lens=audio_context_lens, attention_mode=self.attention_mode
                 )
-                audio_x = audio_x.view(b, q.size(1), n, d)
-                audio_x = audio_x.flatten(2)
+                audio_x = audio_x.view(b, q.size(1), n, d).flatten(2)
             elif len(audio_proj.shape) == 3:
                 ip_key = self.k_proj(audio_proj).view(b, -1, n, d)
                 ip_value = self.v_proj(audio_proj).view(b, -1, n, d)
-                audio_x = attention(q, ip_key, ip_value, k_lens=audio_context_lens, attention_mode=self.attention_mode)
-                audio_x = audio_x.flatten(2)
+                audio_x = attention(q, ip_key, ip_value, k_lens=audio_context_lens, attention_mode=self.attention_mode).flatten(2)
             
             x = x + audio_x * audio_scale
+
         x = self.o(x)
         return x
 
 
 class WanI2VCrossAttention(WanSelfAttention):
 
-    def __init__(self,
-                 dim,
-                 num_heads,
-                 window_size=(-1, -1),
-                 qk_norm=True,
-                 eps=1e-6,
-                 attention_mode='sdpa'):
+    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6, attention_mode='sdpa'):
         super().__init__(dim, num_heads, window_size, qk_norm, eps)
-
         self.k_img = nn.Linear(dim, dim)
         self.v_img = nn.Linear(dim, dim)
-        # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attention_mode = attention_mode
 
-    def forward(self, x, context, context_lens, clip_embed, audio_proj=None, audio_context_lens=None, audio_scale=1.0, num_latent_frames=21):
+    def forward(self, x, context, context_lens, clip_embed, audio_proj=None, audio_context_lens=None, 
+                audio_scale=1.0, num_latent_frames=21, nag_params={}, nag_context=None, is_uncond=False):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -433,41 +459,40 @@ class WanI2VCrossAttention(WanSelfAttention):
             context_lens(Tensor): Shape [B]
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
-
-        # compute query, key, value
+        # compute query
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-           
-        # text attention
-        x = attention(q, k, v, k_lens=context_lens, attention_mode=self.attention_mode)
-        x = x.flatten(2)
+
+        if nag_context is not None and not is_uncond:
+            x_text = self.normalized_attention_guidance(b, n, d, q, context, nag_context, nag_params)
+        else:
+            # text attention
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
+            x_text = attention(q, k, v, k_lens=context_lens, attention_mode=self.attention_mode).flatten(2)
 
         #img attention
         if clip_embed is not None:
             k_img = self.norm_k_img(self.k_img(clip_embed)).view(b, -1, n, d)
             v_img = self.v_img(clip_embed).view(b, -1, n, d)
-            img_x = attention(q, k_img, v_img, k_lens=None, attention_mode=self.attention_mode)
-            img_x = img_x.flatten(2)
-
-            x = x + img_x
+            img_x = attention(q, k_img, v_img, k_lens=None, attention_mode=self.attention_mode).flatten(2)
+            x = x_text + img_x
+        else:
+            x = x_text
 
         # FantasyTalking audio attention
         if audio_proj is not None:
             if len(audio_proj.shape) == 4:
-                audio_q = q.view(b * num_latent_frames, -1, n, d)  # [b, 21, l1, n, d]
+                audio_q = q.view(b * num_latent_frames, -1, n, d)
                 ip_key = self.k_proj(audio_proj).view(b * num_latent_frames, -1, n, d)
                 ip_value = self.v_proj(audio_proj).view(b * num_latent_frames, -1, n, d)
                 audio_x = attention(
                     audio_q, ip_key, ip_value, k_lens=audio_context_lens, attention_mode=self.attention_mode
                 )
-                audio_x = audio_x.view(b, q.size(1), n, d)
-                audio_x = audio_x.flatten(2)
+                audio_x = audio_x.view(b, q.size(1), n, d).flatten(2)
             elif len(audio_proj.shape) == 3:
                 ip_key = self.k_proj(audio_proj).view(b, -1, n, d)
                 ip_value = self.v_proj(audio_proj).view(b, -1, n, d)
-                audio_x = attention(q, ip_key, ip_value, k_lens=audio_context_lens, attention_mode=self.attention_mode)
-                audio_x = audio_x.flatten(2)
+                audio_x = attention(q, ip_key, ip_value, k_lens=audio_context_lens, attention_mode=self.attention_mode).flatten(2)
             
             x = x + audio_x * audio_scale
 
@@ -507,15 +532,16 @@ class WanAttentionBlock(nn.Module):
         self.norm1 = WanLayerNorm(dim, eps)
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
                                           eps, self.attention_mode)
-        self.norm3 = WanLayerNorm(
-            dim, eps,
-            elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
-                                                                      num_heads,
-                                                                      (-1, -1),
-                                                                      qk_norm,
-                                                                      eps,#attention_mode=attention_mode sageattn doesn't seem faster here
-                                                                      )
+        if cross_attn_type != "no_cross_attn":
+            self.norm3 = WanLayerNorm(
+                dim, eps,
+                elementwise_affine=True) if cross_attn_norm else nn.Identity()
+            self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
+                                                                          num_heads,
+                                                                          (-1, -1),
+                                                                          qk_norm,
+                                                                          eps,#attention_mode=attention_mode sageattn doesn't seem faster here
+                                                                          )
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
@@ -538,6 +564,7 @@ class WanAttentionBlock(nn.Module):
     def modulate(self, x, e):
         return x * (1 + e[1]) + e[0]
 
+    #region attention forward
     def forward(
         self,
         x,
@@ -556,8 +583,10 @@ class WanAttentionBlock(nn.Module):
         audio_context_lens=None,
         audio_scale=1.0,
         num_latent_frames=21,
-        block_mask=None
-        
+        block_mask=None,
+        nag_params={},
+        nag_context=None,
+        is_uncond=False
     ):
         r"""
         Args:
@@ -581,7 +610,7 @@ class WanAttentionBlock(nn.Module):
             input_x += camera_embed
 
         # self-attention
-        if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
+        if context is not None and (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
             y = self.self_attn.forward_split(
             input_x, 
             seq_lens, grid_sizes,
@@ -595,7 +624,7 @@ class WanAttentionBlock(nn.Module):
             input_x, 
             seq_lens, grid_sizes,
             freqs, rope_func=rope_func,
-            block_mask=block_mask
+            block_mask=block_mask,
             )
         #ReCamMaster
         if camera_embed is not None:
@@ -607,18 +636,27 @@ class WanAttentionBlock(nn.Module):
         del y
 
         # cross-attention & ffn function
-        if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
-            x = self.split_cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
+        if context is not None:
+            if (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) and x.shape[0] == 1:
+                if nag_context is not None:
+                    raise NotImplementedError("nag_context is not supported in split_cross_attn_ffn")
+                x = self.split_cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes)
+            else:
+                x = self.cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes, 
+                                        audio_proj=audio_proj, audio_context_lens=audio_context_lens, audio_scale=audio_scale, 
+                                        num_latent_frames=num_latent_frames, nag_params=nag_params, nag_context=nag_context, is_uncond=is_uncond)
         else:
-            x = self.cross_attn_ffn(x, context, context_lens, e, clip_embed=clip_embed, grid_sizes=grid_sizes, 
-                                    audio_proj=audio_proj, audio_context_lens=audio_context_lens, audio_scale=audio_scale, num_latent_frames=num_latent_frames)
+            y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
+            x = x + (y * e[5])
         del e
         return x
-    @torch.compiler.disable()
+    #@torch.compiler.disable()
     def cross_attn_ffn(self, x, context, context_lens, e, clip_embed=None, grid_sizes=None, 
-                       audio_proj=None, audio_context_lens=None, audio_scale=1.0, num_latent_frames=21):
+                       audio_proj=None, audio_context_lens=None, audio_scale=1.0, num_latent_frames=21, nag_params={}, 
+                       nag_context=None, is_uncond=False):
             x = x + self.cross_attn(self.norm3(x), context, context_lens, clip_embed=clip_embed,
-                                    audio_proj=audio_proj, audio_context_lens=audio_context_lens, audio_scale=audio_scale, num_latent_frames=num_latent_frames)
+                                    audio_proj=audio_proj, audio_context_lens=audio_context_lens, audio_scale=audio_scale, 
+                                    num_latent_frames=num_latent_frames, nag_params=nag_params, nag_context=nag_context, is_uncond=is_uncond)
             y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
             x = x + (y * e[5])
             return x
@@ -667,7 +705,7 @@ class WanAttentionBlock(nn.Module):
             x_segment = x[:, segment_indices, :]
             
             # Process segment with its prompt and clip embedding
-            processed_segment = self.cross_attn(self.norm3(x_segment), segment_context, segment_context_lens, clip_embed=segment_clip_embed)
+            processed_segment = self.cross_attn(self.norm3(x_segment), segment_context, segment_context_lens, clip_embed=segment_clip_embed, nag_scale=nag_scale)
             processed_segment = processed_segment.to(x.dtype)
             
             # Add to combined result
@@ -836,6 +874,7 @@ class WanModel(ModelMixin, ConfigMixin):
                  main_device=torch.device('cuda'),
                  offload_device=torch.device('cpu'),
                  teacache_coefficients=[],
+                 magcache_ratios=[],
                  vace_layers=None,
                  vace_in_dim=None,
                  inject_sample_info=False,
@@ -907,16 +946,26 @@ class WanModel(ModelMixin, ConfigMixin):
         self.offload_img_emb = False
         self.vace_blocks_to_swap = -1
 
+        self.cache_device = offload_device
+
         #init TeaCache variables
         self.enable_teacache = False
         self.rel_l1_thresh = 0.15
         self.teacache_start_step= 0
         self.teacache_end_step = -1
-        self.teacache_cache_device = offload_device
-        self.teacache_state = TeaCacheState(cache_device=self.teacache_cache_device)
+        self.teacache_state = TeaCacheState(cache_device=self.cache_device)
         self.teacache_coefficients = teacache_coefficients
         self.teacache_use_coefficients = False
         self.teacache_mode = 'e'
+
+        #init MagCache variables
+        self.enable_magcache = False
+        self.magcache_state = MagCacheState(cache_device=self.cache_device)
+        self.magcache_thresh = 0.24
+        self.magcache_K = 4
+        self.magcache_start_step = 0
+        self.magcache_end_step = -1
+        self.magcache_ratios = magcache_ratios
 
         self.slg_blocks = None
         self.slg_start_percent = 0.0
@@ -933,9 +982,10 @@ class WanModel(ModelMixin, ConfigMixin):
         self.original_patch_embedding = self.patch_embedding
         self.expanded_patch_embedding = self.patch_embedding
 
-        self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
-            nn.Linear(dim, dim))
+        if model_type != 'no_cross_attn':
+            self.text_embedding = nn.Sequential(
+                nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
+                nn.Linear(dim, dim))
 
         self.time_embedding = nn.Sequential(
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
@@ -967,7 +1017,13 @@ class WanModel(ModelMixin, ConfigMixin):
             ])
         else:
             # blocks
-            cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
+            if model_type == 't2v':
+                cross_attn_type = 't2v_cross_attn'
+            elif model_type == 'i2v' or model_type == 'fl2v':
+                cross_attn_type = 'i2v_cross_attn'
+            else:
+                cross_attn_type = 'no_cross_attn'
+
             self.blocks = nn.ModuleList([
                 WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                                 window_size, qk_norm, cross_attn_norm, eps,
@@ -1145,11 +1201,12 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         is_uncond=False,
         current_step_percentage=0.0,
+        current_step=0,
+        total_steps=50,
         clip_fea=None,
         y=None,
         device=torch.device('cuda'),
         freqs=None,
-        current_step=0,
         pred_id=None,
         control_lora_enabled=False,
         vace_data=None,
@@ -1164,8 +1221,9 @@ class WanModel(ModelMixin, ConfigMixin):
         pcd_data=None,
         controlnet=None,
         add_cond=None,
-        attn_cond=None
-        
+        attn_cond=None,
+        nag_params={},
+        nag_context=None
     ):
         r"""
         Forward pass through the diffusion model
@@ -1340,18 +1398,30 @@ class WanModel(ModelMixin, ConfigMixin):
             
             e = e.to(self.offload_device, non_blocking=self.use_non_blocking)
 
-        # context
+        # context (test embedding)
         context_lens = None
-        if self.offload_txt_emb:
-            self.text_embedding.to(self.main_device)
-        context = self.text_embedding(
-            torch.stack([
-                torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in context
-            ]).to(x.dtype))
-        if self.offload_txt_emb:
-            self.text_embedding.to(self.offload_device, non_blocking=self.use_non_blocking)
+        if hasattr(self, "text_embedding"):
+            if self.offload_txt_emb:
+                self.text_embedding.to(self.main_device)
+            context = self.text_embedding(
+                torch.stack([
+                    torch.cat(
+                        [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    for u in context
+                ]).to(x.dtype))
+            # NAG
+            if nag_context is not None:
+                nag_context = self.text_embedding(
+                torch.stack([
+                    torch.cat(
+                        [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                    for u in nag_context
+                ]).to(x.dtype))
+            
+            if self.offload_txt_emb:
+                self.text_embedding.to(self.offload_device, non_blocking=self.use_non_blocking)
+        else:
+            context = None
 
         clip_embed = None
         if clip_fea is not None and hasattr(self, "img_emb"):
@@ -1367,9 +1437,7 @@ class WanModel(ModelMixin, ConfigMixin):
         accumulated_rel_l1_distance = torch.tensor(0.0, dtype=torch.float32, device=device)
         if self.enable_teacache and self.teacache_start_step <= current_step <= self.teacache_end_step:
             if pred_id is None:
-                pred_id = self.teacache_state.new_prediction(cache_device=self.teacache_cache_device)
-                #log.info(current_step)
-                #log.info(f"TeaCache: Initializing TeaCache variables for model pred: {pred_id}")
+                pred_id = self.teacache_state.new_prediction(cache_device=self.cache_device)
                 should_calc = True                
             else:
                 previous_modulated_input = self.teacache_state.get(pred_id)['previous_modulated_input']
@@ -1389,29 +1457,64 @@ class WanModel(ModelMixin, ConfigMixin):
                     accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(e0.device) + temb_relative_l1
                     del temb_relative_l1
 
-                #print("accumulated_rel_l1_distance", accumulated_rel_l1_distance)
 
                 if accumulated_rel_l1_distance < self.rel_l1_thresh:
                     should_calc = False
                 else:
                     should_calc = True
                     accumulated_rel_l1_distance = torch.tensor(0.0, dtype=torch.float32, device=device)
-                accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(self.teacache_cache_device)
+                accumulated_rel_l1_distance = accumulated_rel_l1_distance.to(self.cache_device)
 
-            previous_modulated_input = e.to(self.teacache_cache_device).clone() if (self.teacache_use_coefficients and self.teacache_mode == 'e') else e0.to(self.teacache_cache_device).clone()
+            previous_modulated_input = e.to(self.cache_device).clone() if (self.teacache_use_coefficients and self.teacache_mode == 'e') else e0.to(self.cache_device).clone()
            
             if not should_calc:
                 x = x.to(previous_residual.dtype) + previous_residual.to(x.device)
-                #log.info(f"TeaCache: Skipping uncond step {current_step+1}")
                 self.teacache_state.update(
                     pred_id,
                     accumulated_rel_l1_distance=accumulated_rel_l1_distance,
                 )
                 self.teacache_state.get(pred_id)['skipped_steps'].append(current_step)
 
-        if not self.enable_teacache or (self.enable_teacache and should_calc):
-            if self.enable_teacache:
-                original_x = x.to(self.teacache_cache_device).clone()
+        # enable magcache
+        if self.enable_magcache and self.magcache_start_step <= current_step <= self.magcache_end_step:
+            if pred_id is None:
+                pred_id = self.magcache_state.new_prediction(cache_device=self.cache_device)
+                should_calc = True
+            else:
+                accumulated_ratio = self.magcache_state.get(pred_id)['accumulated_ratio']
+                accumulated_err = self.magcache_state.get(pred_id)['accumulated_err']
+                accumulated_steps = self.magcache_state.get(pred_id)['accumulated_steps']
+
+                calibration_len = len(self.magcache_ratios) // 2
+                cur_mag_ratio = self.magcache_ratios[int((current_step*(calibration_len/total_steps)))]
+
+                accumulated_ratio *= cur_mag_ratio
+                accumulated_err += np.abs(1-accumulated_ratio)
+                accumulated_steps += 1
+
+                self.magcache_state.update(
+                    pred_id,
+                    accumulated_ratio=accumulated_ratio,
+                    accumulated_steps=accumulated_steps,
+                    accumulated_err=accumulated_err
+                )
+
+                if accumulated_err<=self.magcache_thresh and accumulated_steps<=self.magcache_K:
+                    should_calc = False
+                    x += self.magcache_state.get(pred_id)['residual_cache'].to(x.device)
+                    self.magcache_state.get(pred_id)['skipped_steps'].append(current_step)
+                else:
+                    should_calc = True
+                    self.magcache_state.update(
+                        pred_id,
+                        accumulated_ratio=1.0,
+                        accumulated_steps=0,
+                        accumulated_err=0
+                    )
+
+        if should_calc:
+            if self.enable_teacache or self.enable_magcache:
+                original_x = x.to(self.cache_device).clone()
 
             if hasattr(self, "dwpose_embedding") and unianim_data is not None:
                 if unianim_data['start_percent'] <= current_step_percentage <= unianim_data['end_percent']:
@@ -1434,7 +1537,10 @@ class WanModel(ModelMixin, ConfigMixin):
                 audio_context_lens=audio_context_lens,
                 num_latent_frames = F,
                 audio_scale=audio_scale,
-                block_mask=self.block_mask
+                block_mask=self.block_mask,
+                nag_params=nag_params,
+                nag_context=nag_context,
+                is_uncond = is_uncond
                 )
             
             if vace_data is not None:
@@ -1497,7 +1603,12 @@ class WanModel(ModelMixin, ConfigMixin):
                     accumulated_rel_l1_distance=accumulated_rel_l1_distance,
                     previous_modulated_input=previous_modulated_input
                 )
-
+            elif self.enable_magcache and (self.magcache_start_step <= current_step <= self.magcache_end_step) and pred_id is not None:
+                self.magcache_state.update(
+                    pred_id,
+                    residual_cache=(x.to(original_x.device) - original_x)
+                )
+                
         if self.ref_conv is not None and fun_ref is not None:
             full_ref_length = fun_ref.size(1)
             x = x[:, full_ref_length:]
@@ -1565,14 +1676,40 @@ class TeaCacheState:
     
     def get(self, pred_id):
         return self.states.get(pred_id, {})
-
-    def report(self):
-        for pred_id in self.states:
-            log.info(f"Prediction {pred_id}: {self.states[pred_id]}")
     
-    def clear_prediction(self, pred_id):
-        if pred_id in self.states:
-            del self.states[pred_id]
+    def clear_all(self):
+        self.states = {}
+        self._next_pred_id = 0
+
+class MagCacheState:
+    def __init__(self, cache_device='cpu'):
+        self.cache_device = cache_device
+        self.states = {}
+        self._next_pred_id = 0
+    
+    def new_prediction(self, cache_device='cpu'):
+        """Create new prediction state and return its ID"""
+        self.cache_device = cache_device
+        pred_id = self._next_pred_id
+        self._next_pred_id += 1
+        self.states[pred_id] = {
+            'residual_cache': None,
+            'accumulated_ratio': 1.0,
+            'accumulated_steps': 0,
+            'accumulated_err': 0,
+            'skipped_steps': [],
+        }
+        return pred_id
+    
+    def update(self, pred_id, **kwargs):
+        """Update state for specific prediction"""
+        if pred_id not in self.states:
+            return None
+        for key, value in kwargs.items():
+            self.states[pred_id][key] = value
+    
+    def get(self, pred_id):
+        return self.states.get(pred_id, {})
     
     def clear_all(self):
         self.states = {}
