@@ -36,6 +36,10 @@ from comfy.cli_args import args, LatentPreviewMethod
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
+def get_device_list():
+    import torch
+    return ["cpu"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+
 def add_noise_to_reference_video(image, ratio=None):
     sigma = torch.ones((image.shape[0],)).to(image.device, image.dtype) * ratio 
     image_noise = torch.randn_like(image) * sigma[:, None, None, None]
@@ -1271,8 +1275,8 @@ class LoadWanVideoClipTextEncoder:
 
 class WanVideoTextEncode:
 
-    _last_cache_key = None
-    _last_result = None
+    _last_cache_key = {}
+    _last_result = {}
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1284,7 +1288,10 @@ class WanVideoTextEncode:
             "optional": {
                 "force_offload": ("BOOLEAN", {"default": True}),
                 "model_to_offload": ("WANVIDEOMODEL", {"tooltip": "Model to move to offload_device before encoding"}),
-            }
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("WANVIDEOTEXTEMBEDS", )
@@ -1293,7 +1300,7 @@ class WanVideoTextEncode:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Encodes text prompts into text embeddings. For rudimentary prompt travel you can input multiple prompts separated by '|', they will be equally spread over the video length"
 
-    def process(self, t5, positive_prompt, negative_prompt,force_offload=True, model_to_offload=None):
+    def process(self, t5, positive_prompt, negative_prompt,force_offload=True, model_to_offload=None, unique_id = None):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1307,13 +1314,10 @@ class WanVideoTextEncode:
             id(model_to_offload.model) if model_to_offload is not None else None,
         )
 
-        if self.__class__._last_cache_key == cache_key:
-            print("WANVIDEO TEXTENCODE: Returning cached embeddings")
-            return self.__class__._last_result
-        else:
-            if self.__class__._last_result is not None:
+        if unique_id not in self.__class__._last_cache_key or self.__class__._last_cache_key[unique_id] != cache_key:
+            if unique_id in self.__class__._last_result and self.__class__._last_result[unique_id] is not None:
                 # Explicitly move tensors to CPU and delete
-                result = self.__class__._last_result
+                result = self.__class__._last_result[unique_id]
                 if isinstance(result, tuple) and isinstance(result[0], dict):
                     for k, v in result[0].items():
                         if isinstance(v, list):
@@ -1322,10 +1326,14 @@ class WanVideoTextEncode:
                                     t.cpu()
                 del result
 
-            self.__class__._last_cache_key = None
-            self.__class__._last_result = None
+            self.__class__._last_cache_key[unique_id] = None
+            self.__class__._last_result[unique_id] = None
             torch.cuda.empty_cache()
             gc.collect()
+
+        else:
+            print("WANVIDEO TEXTENCODE: Returning cached embeddings")
+            return self.__class__._last_result[unique_id]
 
         if model_to_offload is not None:
             log.info(f"Moving video model to {offload_device}")
@@ -1367,8 +1375,8 @@ class WanVideoTextEncode:
                 "negative_prompt_embeds": context_null,
             }
 
-        self.__class__._last_cache_key = cache_key
-        self.__class__._last_result = (prompt_embeds_dict,)
+        self.__class__._last_cache_key[unique_id] = cache_key
+        self.__class__._last_result[unique_id] = (prompt_embeds_dict,)
         
         return (prompt_embeds_dict,)
     
@@ -1438,6 +1446,19 @@ class WanVideoTextEncodeSingle:
                 "negative_prompt_embeds": None,
             }
         return (prompt_embeds_dict,)
+
+class TextEmbedsToDevice:
+    RETURN_TYPES = ("WANVIDEOTEXTEMBEDS", )
+    FUNCTION = "process"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        devices = get_device_list()
+        default_device = devices[1] if len(devices) > 1 else devices[0]
+        return {"required": {"in_embeds":  ("WANVIDEOTEXTEMBEDS", ), "device": (devices, {"default": default_device})}}
+
+    def process(self, in_embeds, device):
+        return (in_embeds.to(device),)
     
 class WanVideoApplyNAG:
     @classmethod
@@ -4043,6 +4064,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoDecode": WanVideoDecode,
     "WanVideoTextEncode": WanVideoTextEncode,
     "WanVideoTextEncodeSingle": WanVideoTextEncodeSingle,
+    "TextEmbedsToDevice": TextEmbedsToDevice,
     "WanVideoModelLoader": WanVideoModelLoader,
     "WanVideoVAELoader": WanVideoVAELoader,
     "LoadWanVideoT5TextEncoder": LoadWanVideoT5TextEncoder,
@@ -4084,6 +4106,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoDecode": "WanVideo Decode",
     "WanVideoTextEncode": "WanVideo TextEncode",
     "WanVideoTextEncodeSingle": "WanVideo TextEncodeSingle",
+    "TextEmbedsToDevice": "WanVideo Send Text Embeds To Device",
     "WanVideoTextImageEncode": "WanVideo TextImageEncode (IP2V)",
     "WanVideoModelLoader": "WanVideo Model Loader",
     "WanVideoVAELoader": "WanVideo VAE Loader",
