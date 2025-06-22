@@ -40,6 +40,15 @@ def get_device_list():
     import torch
     return ["cpu"] + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
 
+def move_to_device(obj, device):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    elif isinstance(obj, dict):
+        return {k: move_to_device(v, device) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [move_to_device(i, device) for i in obj]
+    return obj  # fallback
+
 def add_noise_to_reference_video(image, ratio=None):
     sigma = torch.ones((image.shape[0],)).to(image.device, image.dtype) * ratio 
     image_noise = torch.randn_like(image) * sigma[:, None, None, None]
@@ -1447,7 +1456,7 @@ class WanVideoTextEncodeSingle:
             }
         return (prompt_embeds_dict,)
 
-class TextEmbedsToDevice:
+class WanVideoTextEmbedsToDevice:
     RETURN_TYPES = ("WANVIDEOTEXTEMBEDS", )
     FUNCTION = "process"
 
@@ -1458,7 +1467,7 @@ class TextEmbedsToDevice:
         return {"required": {"in_embeds":  ("WANVIDEOTEXTEMBEDS", ), "device": (devices, {"default": default_device})}}
 
     def process(self, in_embeds, device):
-        return (in_embeds.to(device),)
+        return (move_to_device(in_embeds, device), )
     
 class WanVideoApplyNAG:
     @classmethod
@@ -4064,7 +4073,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoDecode": WanVideoDecode,
     "WanVideoTextEncode": WanVideoTextEncode,
     "WanVideoTextEncodeSingle": WanVideoTextEncodeSingle,
-    "TextEmbedsToDevice": TextEmbedsToDevice,
+    "WanVideoTextEmbedsToDevice": WanVideoTextEmbedsToDevice,
     "WanVideoModelLoader": WanVideoModelLoader,
     "WanVideoVAELoader": WanVideoVAELoader,
     "LoadWanVideoT5TextEncoder": LoadWanVideoT5TextEncoder,
@@ -4106,7 +4115,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoDecode": "WanVideo Decode",
     "WanVideoTextEncode": "WanVideo TextEncode",
     "WanVideoTextEncodeSingle": "WanVideo TextEncodeSingle",
-    "TextEmbedsToDevice": "WanVideo Send Text Embeds To Device",
+    "WanVideoTextEmbedsToDevice": "WanVideo Send Text Embeds To Device",
     "WanVideoTextImageEncode": "WanVideo TextImageEncode (IP2V)",
     "WanVideoModelLoader": "WanVideo Model Loader",
     "WanVideoVAELoader": "WanVideo VAE Loader",
