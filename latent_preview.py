@@ -7,6 +7,7 @@ import folder_paths
 import comfy.utils
 import logging
 import os
+import struct
 
 from .taehv import TAEHV
 
@@ -98,9 +99,9 @@ def prepare_callback(model, steps, x0_output_dict=None):
         preview_format = "JPEG"
 
     previewer = get_previewer(model.load_device, model.model.latent_format)
-    print("previewer: ", previewer)
 
-    pbar = comfy.utils.ProgressBar(steps)
+    if steps is not None:
+        pbar = comfy.utils.ProgressBar(steps)
     def callback(step, x0, x, total_steps):
         if x0_output_dict is not None:
             x0_output_dict["x0"] = x0
@@ -108,7 +109,8 @@ def prepare_callback(model, steps, x0_output_dict=None):
         preview_bytes = None
         if previewer:
             preview_bytes = previewer.decode_latent_to_preview_image(preview_format, x0)
-        pbar.update_absolute(step + 1, total_steps, preview_bytes)
+        if step is not None:
+            pbar.update_absolute(step + 1, total_steps, preview_bytes)
     return callback
 
 #borrowed VideoHelperSuite https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite/blob/main/videohelpersuite/latent_preview.py
@@ -153,7 +155,7 @@ class WrappedPreviewer(LatentPreviewer):
             return None
         if self.first_preview:
             self.first_preview = False
-            serv.send_sync('VHS_latentpreview', {'length':num_images, 'rate': self.rate})
+            serv.send_sync('VHS_latentpreview', {'length':num_images, 'rate': self.rate, 'id': serv.last_node_id})
             self.last_time = new_time + 1/self.rate
         if self.c_index + num_previews > num_images:
             x0 = x0.roll(-self.c_index, 0)[:num_previews]
@@ -185,6 +187,7 @@ class WrappedPreviewer(LatentPreviewer):
             message = io.BytesIO()
             message.write((1).to_bytes(length=4, byteorder='big')*2)
             message.write(ind.to_bytes(length=4, byteorder='big'))
+            message.write(struct.pack('16p', serv.last_node_id.encode('ascii')))
             i.save(message, format="JPEG", quality=95, compress_level=1)
             #NOTE: send sync already uses call_soon_threadsafe
             serv.send_sync(server.BinaryEventTypes.PREVIEW_IMAGE,
