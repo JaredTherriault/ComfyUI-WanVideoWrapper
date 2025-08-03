@@ -698,6 +698,9 @@ class WanVideoSetLoRAs:
 
 #region Model loading
 class WanVideoModelLoader:
+    _last_cache_key = None
+    _last_result = None
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -737,6 +740,32 @@ class WanVideoModelLoader:
                   compile_args=None, attention_mode="sdpa", block_swap_args=None, lora=None, vram_management_args=None, vace_model=None, fantasytalking_model=None, multitalk_model=None):
         assert not (vram_management_args is not None and block_swap_args is not None), "Can't use both block_swap_args and vram_management_args at the same time"
         
+        cache_key = (
+            model, base_precision, load_device, quantization,
+            repr(compile_args), attention_mode, repr(block_swap_args), repr(lora), repr(vram_management_args),
+            vace_model, fantasytalking_model, multitalk_model
+        )
+
+        if self.__class__._last_cache_key == cache_key:
+            print("WANVIDEO: Returning cached model")
+            return self.__class__._last_result
+        else:
+            if self.__class__._last_result is not None:
+                # Explicitly move tensors to CPU and delete
+                result = self.__class__._last_result
+                if isinstance(result, tuple) and isinstance(result[0], dict):
+                    for k, v in result[0].items():
+                        if isinstance(v, list):
+                            for t in v:
+                                if isinstance(t, torch.Tensor):
+                                    t.cpu()
+                del result
+
+            self.__class__._last_cache_key = None
+            self.__class__._last_result = None
+            torch.cuda.empty_cache()
+            gc.collect()
+
         lora_low_mem_load = merge_loras = False
         if lora is not None:
             for l in lora:
@@ -1242,6 +1271,9 @@ class WanVideoModelLoader:
         for model in mm.current_loaded_models:
             if model._model() == patcher:
                 mm.current_loaded_models.remove(model)
+
+        self.__class__._last_cache_key[unique_id] = cache_key
+        self.__class__._last_result[unique_id] = (patcher,)
 
         return (patcher,)
     

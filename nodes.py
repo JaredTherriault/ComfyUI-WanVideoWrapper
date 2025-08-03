@@ -159,6 +159,10 @@ class WanVideoBlockList:
 
 #region TextEncode
 class WanVideoTextEncode:
+
+    _last_cache_key = {}
+    _last_result = {}
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
@@ -171,7 +175,10 @@ class WanVideoTextEncode:
                 "model_to_offload": ("WANVIDEOMODEL", {"tooltip": "Model to move to offload_device before encoding"}),
                 "use_disk_cache": ("BOOLEAN", {"default": False, "tooltip": "Cache the text embeddings to disk for faster re-use, under the custom_nodes/ComfyUI-WanVideoWrapper/text_embed_cache directory"}),
                 "device": (["gpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on."}),
-            }
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("WANVIDEOTEXTEMBEDS", )
@@ -181,7 +188,7 @@ class WanVideoTextEncode:
     DESCRIPTION = "Encodes text prompts into text embeddings. For rudimentary prompt travel you can input multiple prompts separated by '|', they will be equally spread over the video length"
 
 
-    def process(self, positive_prompt, negative_prompt, t5=None, force_offload=True, model_to_offload=None, use_disk_cache=False, device="gpu"):
+    def process(self, positive_prompt, negative_prompt, t5=None, force_offload=True, model_to_offload=None, use_disk_cache=False, device="gpu", unique_id = None):
         if t5 is None and not use_disk_cache:
             raise ValueError("T5 encoder is required for text encoding. Please provide a valid T5 encoder or enable disk cache.")
 
@@ -225,9 +232,41 @@ class WanVideoTextEncode:
                     "negative_prompt_embeds": context_null,
                 }
                 return (prompt_embeds_dict,)
+        else:
+            cache_key = (
+                positive_prompt,
+                negative_prompt,
+                id(t5["model"]),  # use id() to uniquely track this encoder instance
+                t5.get("dtype"),
+                force_offload,
+                id(model_to_offload.model) if model_to_offload is not None else None,
+                use_disk_cache,
+                device
+            )
 
         if t5 is None:
             raise ValueError("No cached text embeds found for prompts, please provide a T5 encoder.")
+
+            if unique_id not in self.__class__._last_cache_key or self.__class__._last_cache_key[unique_id] != cache_key:
+                if unique_id in self.__class__._last_result and self.__class__._last_result[unique_id] is not None:
+                    # Explicitly move tensors to CPU and delete
+                    result = self.__class__._last_result[unique_id]
+                    if isinstance(result, tuple) and isinstance(result[0], dict):
+                        for k, v in result[0].items():
+                            if isinstance(v, list):
+                                for t in v:
+                                    if isinstance(t, torch.Tensor):
+                                        t.cpu()
+                    del result
+
+                self.__class__._last_cache_key[unique_id] = None
+                self.__class__._last_result[unique_id] = None
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            else:
+                print("WANVIDEO TEXTENCODE: Returning cached embeddings")
+                return self.__class__._last_result[unique_id]
 
         if model_to_offload is not None and device == "gpu":
             log.info(f"Moving video model to {offload_device}")
@@ -310,6 +349,10 @@ class WanVideoTextEncode:
                     log.info(f"Saved prompt embeds to cache: {neg_cache_path}")
             except Exception as e:
                 log.warning(f"Failed to save cache: {e}")
+
+        if not use_disk_cache:
+            self.__class__._last_cache_key[unique_id] = cache_key
+            self.__class__._last_result[unique_id] = (prompt_embeds_dict,)
 
         return (prompt_embeds_dict,)
     
@@ -957,6 +1000,10 @@ class WanVideoSLG:
 
 #region VACE
 class WanVideoVACEEncode:
+
+    _last_cache_key = None
+    _last_result = None
+
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
@@ -983,6 +1030,40 @@ class WanVideoVACEEncode:
     CATEGORY = "WanVideoWrapper"
 
     def process(self, vae, width, height, num_frames, strength, vace_start_percent, vace_end_percent, input_frames=None, ref_images=None, input_masks=None, prev_vace_embeds=None, tiled_vae=False):
+        
+        def _tensor_hash(tensor):
+            return hashlib.sha256(tensor.cpu().numpy().tobytes()).hexdigest()
+
+        cache_key = (
+            id(vae),
+            width, height, num_frames, strength, vace_start_percent, vace_end_percent,
+            _tensor_hash(input_frames) if input_frames is not None else None,
+            _tensor_hash(ref_images) if ref_images is not None else None,
+            _tensor_hash(input_masks) if input_masks is not None else None,
+            repr(prev_vace_embeds),
+            tiled_vae,
+        )
+
+        if self.__class__._last_cache_key == cache_key:
+            print("WanVideoVACEEncode: Returning cached embeds")
+            return self.__class__._last_result
+        else:
+            if self.__class__._last_result is not None:
+                # Explicitly move tensors to CPU and delete
+                result = self.__class__._last_result
+                if isinstance(result, tuple) and isinstance(result[0], dict):
+                    for k, v in result[0].items():
+                        if isinstance(v, list):
+                            for t in v:
+                                if isinstance(t, torch.Tensor):
+                                    t.cpu()
+                del result
+
+            self.__class__._last_cache_key = None
+            self.__class__._last_result = None
+            torch.cuda.empty_cache()
+            gc.collect()
+        
         vae = vae.to(device)
 
         width = (width // 16) * 16
@@ -1058,6 +1139,9 @@ class WanVideoVACEEncode:
             if "additional_vace_inputs" in prev_vace_embeds and prev_vace_embeds["additional_vace_inputs"]:
                 vace_input["additional_vace_inputs"] = prev_vace_embeds["additional_vace_inputs"].copy()
             vace_input["additional_vace_inputs"].append(prev_vace_embeds)
+                
+        self.__class__._last_cache_key = cache_key
+        self.__class__._last_result = (vace_input,)   
     
         return (vace_input,)
     def vace_encode_frames(self, vae, frames, ref_images, masks=None, tiled_vae=False):
